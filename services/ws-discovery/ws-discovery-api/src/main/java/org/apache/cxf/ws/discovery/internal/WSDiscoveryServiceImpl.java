@@ -30,29 +30,28 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.logging.Level;
 import java.util.logging.Logger;
-
 import javax.xml.bind.JAXBContext;
 import javax.xml.bind.JAXBElement;
 import javax.xml.bind.JAXBException;
 import javax.xml.bind.annotation.XmlSeeAlso;
-import javax.xml.bind.util.JAXBSource;
 import javax.xml.namespace.QName;
+import javax.xml.parsers.DocumentBuilderFactory;
+import javax.xml.parsers.ParserConfigurationException;
+import javax.xml.soap.SOAPException;
+import javax.xml.soap.SOAPMessage;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
-import javax.xml.stream.XMLStreamWriter;
-import javax.xml.transform.Source;
-import javax.xml.transform.dom.DOMResult;
-import javax.xml.transform.dom.DOMSource;
 import javax.xml.ws.Endpoint;
 import javax.xml.ws.EndpointReference;
 import javax.xml.ws.Provider;
+import javax.xml.ws.Service;
+import javax.xml.ws.ServiceMode;
 import javax.xml.ws.WebServiceProvider;
 import javax.xml.ws.soap.Addressing;
 import javax.xml.ws.wsaddressing.W3CEndpointReference;
 import javax.xml.ws.wsaddressing.W3CEndpointReferenceBuilder;
-
 import org.w3c.dom.Document;
-
+import org.w3c.dom.NamedNodeMap;
 import org.apache.cxf.Bus;
 import org.apache.cxf.BusFactory;
 import org.apache.cxf.common.jaxb.JAXBContextCache;
@@ -423,7 +422,8 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
         portName = "DiscoveryUDP")
     @XmlSeeAlso(ObjectFactory.class)
     @Addressing(required = true)
-    class WSDiscoveryProvider implements Provider<Source> {
+    @ServiceMode(value = Service.Mode.MESSAGE)
+    class WSDiscoveryProvider implements Provider<SOAPMessage> {
         
         JAXBContext context;
         WSDiscoveryProvider() {
@@ -434,11 +434,12 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
             }
         }
         
-        private Source mapToOld(Document doc, JAXBElement<?> mt) throws JAXBException, XMLStreamException {
-            doc.removeChild(doc.getDocumentElement());
-            DOMResult result = new DOMResult(doc);
-            XMLStreamWriter r = StaxUtils.createXMLStreamWriter(result);
-            context.createMarshaller().marshal(mt, r);
+        private SOAPMessage mapToOld(SOAPMessage message, JAXBElement<?> mt)
+          throws JAXBException, XMLStreamException, SOAPException, ParserConfigurationException
+        {
+            Document doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().newDocument();
+            context.createMarshaller().marshal(mt, doc);
+
             
             XMLStreamReader domReader = StaxUtils.createXMLStreamReader(doc);
             Map<String, String> inMap = new HashMap<String, String>();
@@ -449,11 +450,34 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
             
             InTransformReader reader = new InTransformReader(domReader, inMap, null, false);
             doc = StaxUtils.read(reader);
-            return new DOMSource(doc);            
+            message.getSOAPBody().removeContents();
+
+            // Remove header contents so that they can get modified by the interceptor
+            // If no header is created then the message will error on send
+            message.getSOAPHeader().removeContents();
+            message.getSOAPBody().addDocument(doc);
+            message.saveChanges();
+            return message;
         }
+
+        private SOAPMessage createReturnMessage(SOAPMessage message, JAXBElement<?> mt)
+          throws JAXBException, XMLStreamException, ParserConfigurationException, SOAPException
+        {
+            Document doc = DocumentBuilderFactory.newInstance().newDocumentBuilder().newDocument();
+            context.createMarshaller().marshal(mt, doc);
+
+            // Remove header contents so that they can get modified by the interceptor
+            // If no header is created then the message will error on send
+            message.getSOAPBody().removeContents();
+            message.getSOAPHeader().removeContents();
+            message.getSOAPBody().addDocument(doc);
+            message.saveChanges();
+            return message;
+        }
+
         private void updateOutputAction(String append) {
             AddressingProperties p = ContextUtils.retrieveMAPs(PhaseInterceptorChain.getCurrentMessage(),
-                                                               false, false);
+                                                               false, false, true);
             AddressingProperties pout = new AddressingProperties();
             AttributedURIType action = new AttributedURIType();
             action.setValue(p.getAction().getValue() + append);
@@ -477,14 +501,28 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
             return doc;
         }
 
-        public Source invoke(Source request) {
-            Source ret = null;
+        public SOAPMessage invoke(SOAPMessage request) {
+            SOAPMessage ret = null;
             try {
-                //Bug in JAXB - if you pass the StaxSource or SaxSource into unmarshall,
-                //the namespaces for the QNames for the Types elements are lost.
-                //Since WS-Discovery messages are small (UDP datagram size), parsing to DOM
-                //is not a HUGE deal
-                Document doc = StaxUtils.read(request);
+
+                // BUG in getting soap body. Any namespaces declared in the SOAP envelope header are
+                // lost when getting the body. The following code will get all unique namespaces from the
+                // envelope attributes and copy them into the body DOM so JAXB can marshal and demarshal the messages
+                // correctly.
+                Document doc = request.getSOAPBody().extractContentAsDocument();
+
+                NamedNodeMap envelopeAttributes = request.getSOAPPart().getEnvelope().getAttributes();
+                for (int i = 0; i < envelopeAttributes.getLength(); ++i) {
+                    if (envelopeAttributes.item(i).getLocalName().contentEquals("xmlns")) {
+                        continue;
+                    }
+                    doc.getDocumentElement().setAttributeNS(envelopeAttributes.item(i).getNamespaceURI(),
+                        "xmlns:" + envelopeAttributes.item(i).getLocalName(),
+                        envelopeAttributes.item(i).getNodeValue());
+                    envelopeAttributes.removeNamedItemNS(envelopeAttributes.item(i).getNamespaceURI(),
+                        envelopeAttributes.item(i).getLocalName());
+                }
+
                 boolean mapToOld = false;
                 if ("http://schemas.xmlsoap.org/ws/2005/04/discovery"
                     .equals(doc.getDocumentElement().getNamespaceURI())) {
@@ -510,9 +548,9 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
                     }
                     updateOutputAction("Matches");
                     if (mapToOld) {
-                        ret = mapToOld(doc, factory.createProbeMatches(pmt));
+                        ret = mapToOld(request, factory.createProbeMatches(pmt));
                     } else {
-                        ret = new JAXBSource(context, factory.createProbeMatches(pmt));
+                        ret = createReturnMessage(request, factory.createProbeMatches(pmt));
                     }
                 } else if (obj instanceof ResolveType) {
                     ResolveMatchesType rmt = handleResolve((ResolveType)obj);
@@ -521,9 +559,9 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
                     }
                     updateOutputAction("Matches");
                     if (mapToOld) {
-                        ret = mapToOld(doc, factory.createResolveMatches(rmt));
+                        ret = mapToOld(request, factory.createResolveMatches(rmt));
                     } else {
-                        ret = new JAXBSource(context, factory.createResolveMatches(rmt));
+                        ret = createReturnMessage(request, factory.createResolveMatches(rmt));
                     }
                 } else if (obj instanceof HelloType) {
                     //check if it's a DiscoveryProxy
@@ -554,11 +592,13 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
                     }
                 }
             } catch (JAXBException e) {
-                // TODO Auto-generated catch block
                 e.printStackTrace();
             } catch (XMLStreamException e1) {
-                // TODO Auto-generated catch block
                 e1.printStackTrace();
+            } catch (SOAPException e) {
+                e.printStackTrace();
+            } catch (ParserConfigurationException e) {
+                e.printStackTrace();
             }
             return ret;
         }
