@@ -212,10 +212,41 @@ public class WSDiscoveryServiceImpl implements WSDiscoveryService {
         if (o instanceof List) {
             List<?> l = (List)o;
             for (Object o2 : l) {
-                ht.getScopes().getValue().add(o2.toString());
+                if (!ht.getScopes().getValue().contains(o2.toString())) {
+                    ht.getScopes().getValue().add(o2.toString());
+                }
             }
         } else {
-            ht.getScopes().getValue().add(o.toString());
+            if (!ht.getScopes().getValue().contains(o.toString())) {
+                ht.getScopes().getValue().add(o.toString());
+            }
+        }
+    }
+
+    public void setScopes(Object o) {
+        for (HelloType ht : registered) {
+            setScopes(ht, o);
+        }
+    }
+
+    private void removeScopes(HelloType ht, Object o) {
+        if (o instanceof List) {
+            List<?> l = (List)o;
+            for (Object o2 : l) {
+                if (ht.getScopes().getValue().contains(o2.toString())) {
+                    ht.getScopes().getValue().remove(o2.toString());
+                }
+            }
+        } else {
+            if (ht.getScopes().getValue().contains(o.toString())) {
+                ht.getScopes().getValue().remove(o.toString());
+            }
+        }
+    }
+
+    public void removeScopes(Object o) {
+        for (HelloType ht : registered) {
+            removeScopes(ht, o);
         }
     }
 
